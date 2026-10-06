@@ -81,6 +81,9 @@ class Miner:
         self.rect.centerx += round((target_x - self.rect.centerx) * min(1.0, delta_seconds * 4.0))
         self.rect.centery += round((target_y - self.rect.centery) * min(1.0, delta_seconds * 4.0))
 
+    def set_position(self, position):
+        self.rect.center = position
+
 
 class Sprite:
     def __init__(self, path, size):
@@ -154,10 +157,11 @@ class TileMap:
         self.set_current_row()
 
     def create_row(self):
-        other_tiles = ("base", "base2", "gold_broken", "broken", "empty")
+        # The broken gold sprite is reserved for the active mining animation.
+        other_tiles = ("base", "base2", "broken", "empty")
         row = []
         for column_index in range(GRID_COLUMNS):
-            if self.rng.random() < 0.10:
+            if self.rng.random() < 0.05:
                 tile_name = "gold"
             else:
                 tile_name = self.rng.choice(other_tiles)
@@ -284,14 +288,21 @@ class TileMap:
 
 
 class MineController:
+    STORAGE_X = 55
+    TRAVEL_SECONDS = 2.4
+    MINING_SECONDS = 1.8
+    BROKEN_FRAME_AT = 0.75
+
     def __init__(self, tile_map):
         self.tile_map = tile_map
         self.storage = Storage(capacity=9999)
         self.economy = Economy(credits=100)
-        self.speeds = [1.0, 1.0]
+        # Speeds are deliberately conservative at the start so the round trip
+        # and mining animation are easy to follow.
+        self.speeds = [0.45, 0.45]
         self.inspectors = [False, False]
         self.rows = [0, 1]
-        self.states = ["moving", "moving"]
+        self.states = ["idle", "idle"]
         self.timers = [0.0, 0.0]
         self.targets = [None, None]
         self.loads = [0, 0]
@@ -338,15 +349,15 @@ class MineController:
         self.economy.credits -= price
         self.economy.levels[upgrade] = self.economy.levels.get(upgrade, 0) + 1
         if upgrade == "miner":
-            self.speeds.append(1.0)
+            self.speeds.append(0.45)
             self.inspectors.append(False)
             self.rows.append(len(self.rows))
-            self.states.append("moving")
+            self.states.append("idle")
             self.timers.append(0.0)
             self.targets.append(None)
             self.loads.append(0)
         elif upgrade == "speed":
-            self.speeds[self.selected] += 1.0
+            self.speeds[self.selected] += 0.25
         else:
             self.inspectors[self.selected] = True
         self.cache_layout()
@@ -391,9 +402,59 @@ class MineController:
         else:
             self.states[miner_index] = "searching"
 
+    def travel_duration(self, miner_index):
+        return self.TRAVEL_SECONDS / max(0.1, self.speeds[miner_index])
+
+    def start_next_trip(self, miner_index):
+        target = self.choose_target(miner_index)
+        self.targets[miner_index] = target
+        self.timers[miner_index] = 0.0
+        if target is None:
+            self.states[miner_index] = "idle"
+        else:
+            self.states[miner_index] = "moving"
+
+    def remap_rows_after_scroll(self):
+        last_row = len(self.tile_map.layout) - 1
+        for index, row in enumerate(self.rows):
+            self.rows[index] = last_row if row == 0 else row - 1
+            self.targets[index] = None
+            self.timers[index] = 0.0
+            if self.states[index] == "idle":
+                self.states[index] = "searching"
+
+    def visual_position(self, miner_index):
+        row = self.rows[miner_index]
+        # The tilemap scrolls beneath the miners; actors stay on their row layer.
+        y = row * TILE_SIZE + TILE_SIZE // 2
+        storage_position = (self.STORAGE_X, y)
+        target = self.targets[miner_index]
+        if target is None:
+            return storage_position
+
+        target_position = (target * TILE_SIZE + TILE_SIZE // 2, y)
+        state = self.states[miner_index]
+        if state == "moving":
+            progress = min(1.0, self.timers[miner_index] / self.travel_duration(miner_index))
+            return (
+                round(storage_position[0] + (target_position[0] - storage_position[0]) * progress),
+                y,
+            )
+        if state == "returning":
+            progress = min(1.0, self.timers[miner_index] / self.travel_duration(miner_index))
+            return (
+                round(target_position[0] + (storage_position[0] - target_position[0]) * progress),
+                y,
+            )
+        if state == "mining":
+            return target_position
+        return storage_position
+
     def update(self, delta_seconds):
         if self.tile_map.is_scrolling:
             self.tile_map.update_mining(delta_seconds)
+            if not self.tile_map.is_scrolling:
+                self.remap_rows_after_scroll()
             return
 
         for index in range(len(self.rows)):
@@ -403,38 +464,38 @@ class MineController:
                     self.states[index] = "searching"
                 continue
 
-            if self.states[index] in ("moving", "searching"):
-                self.targets[index] = self.choose_target(index)
-                if self.targets[index] is None:
-                    self.states[index] = "returning"
-                    continue
-                self.timers[index] += delta_seconds * self.speeds[index]
-                if self.timers[index] >= 0.8:
+            if self.states[index] in ("idle", "searching"):
+                self.start_next_trip(index)
+                continue
+            if self.states[index] == "moving":
+                self.timers[index] += delta_seconds
+                if self.timers[index] >= self.travel_duration(index):
                     self.states[index] = "mining"
                     self.timers[index] = 0.0
             elif self.states[index] == "mining":
-                self.timers[index] += delta_seconds * self.speeds[index]
+                self.timers[index] += delta_seconds
                 row = self.rows[index]
                 column = self.targets[index]
-                if self.timers[index] >= 0.6:
+                if self.timers[index] >= self.BROKEN_FRAME_AT:
+                    self.tile_map.layout[row][column] = "gold_broken"
+                if self.timers[index] >= self.MINING_SECONDS:
                     quantity_key = (row, column)
                     quantity = self.tile_map.gold_quantities.get(quantity_key, 0)
                     if quantity > 0:
-                        self.tile_map.gold_quantities[quantity_key] = quantity - 1
-                        self.tile_map.layout[row][column] = (
-                            "gold_broken" if quantity == 1 else "gold"
-                        )
-                    self.loads[index] = 1
+                        self.tile_map.gold_quantities[quantity_key] = 0
+                        self.tile_map.layout[row][column] = "empty"
+                        self.loads[index] = 1
+                    else:
+                        self.tile_map.layout[row][column] = "empty"
                     self.states[index] = "returning"
                     self.timers[index] = 0.0
             elif self.states[index] == "returning":
-                self.timers[index] += delta_seconds * self.speeds[index]
-                if self.timers[index] >= 0.8:
-                    self.loads[index] = 0
+                self.timers[index] += delta_seconds
+                if self.timers[index] >= self.travel_duration(index):
                     self.deliver(index)
                     self.timers[index] = 0.0
 
-        if self.all_assigned_rows_empty() and not self.tile_map.is_scrolling:
+        if any(state == "idle" for state in self.states) and not self.tile_map.is_scrolling:
             self.tile_map.start_row_scroll()
 
 
@@ -444,7 +505,7 @@ def draw_text(surface, text, position, color=(255, 255, 255), selected_font=None
 
 visual_miners = [Miner(110, TILE_SIZE // 2), Miner(110, TILE_SIZE + TILE_SIZE // 2)]
 inspector_sprite = Sprite(
-    os.path.join(BASE_DIR, "inspector.webp"), (32, 32)
+    os.path.join(ASSETS_DIR, "inspector.webp"), (32, 32)
 )
 storage_sprite = Sprite(
     os.path.join(ASSETS_DIR, "storage.webp"), (72, 72)
@@ -487,34 +548,33 @@ while running:
         mine.update(delta_seconds)
         tile_map.draw(screen)
         for index, visual_miner in enumerate(visual_miners):
-            row = mine.rows[index]
-            y = row * TILE_SIZE + TILE_SIZE // 2
-            target = mine.targets[index]
-            if mine.states[index] in ("mining", "returning") and target is not None:
-                target_position = (
-                    target * TILE_SIZE + TILE_SIZE // 2,
-                    y,
-                )
-            else:
-                target_position = (110, y)
-            visual_miner.move_to(target_position, delta_seconds * mine.speeds[index])
+            visual_miner.set_position(mine.visual_position(index))
             visual_miner.draw(screen)
             if mine.inspectors[index]:
                 inspector_sprite.draw(
                     screen,
                     (visual_miner.rect.centerx - 50, visual_miner.rect.centery),
                 )
-        storage_sprite.draw(screen, (55, BOTTOM // 2))
-        panel = pygame.Surface((RIGHT, 145), pygame.SRCALPHA)
+        for row in mine.rows:
+            storage_sprite.draw(
+                screen,
+                (mine.STORAGE_X, row * TILE_SIZE + TILE_SIZE // 2),
+            )
+        panel_width = 760
+        panel_height = 175
+        panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
         panel.fill((10, 10, 18, 210))
-        screen.blit(panel, (0, 0))
+        panel_position = (10, BOTTOM - panel_height - 10)
+        screen.blit(panel, panel_position)
         selected = mine.selected
-        draw_text(screen, f"Gold: {mine.economy.credits}", (20, 16), selected_font=large_font)
-        draw_text(screen, f"Purity: {mine.last_quality:.0%}  Accepted: {mine.total_real_ore / max(1, mine.total_actions):.0%}", (300, 22))
-        draw_text(screen, f"Miners: {len(visual_miners)}  Selected: {selected + 1}", (20, 60))
-        draw_text(screen, f"Speed: {mine.selected_speed():.0f}  Inspector: {'yes' if mine.selected_inspector() else 'no'}  State: {mine.states[selected]}", (20, 88))
-        draw_text(screen, f"Rejected: {mine.rejected_loads}  Silent errors: {mine.silent_errors}", (20, 116))
-        draw_text(screen, f"[M] Miner ${mine.price('miner')}  [S] Speed ${mine.price('speed')}  [I] Inspector ${mine.price('inspector')}  [1-9] Select", (360, 116), (255, 220, 100))
+        panel_x, panel_y = panel_position
+        draw_text(screen, f"Gold: {mine.economy.credits}", (panel_x + 15, panel_y + 12), selected_font=large_font)
+        draw_text(screen, f"Purity: {mine.last_quality:.0%}  Accepted: {mine.total_real_ore / max(1, mine.total_actions):.0%}", (panel_x + 260, panel_y + 22))
+        draw_text(screen, f"Miners: {len(visual_miners)}  Selected: {selected + 1}", (panel_x + 15, panel_y + 62))
+        draw_text(screen, f"Speed: {mine.selected_speed():.0f}  Inspector: {'yes' if mine.selected_inspector() else 'no'}  State: {mine.states[selected]}", (panel_x + 15, panel_y + 90))
+        draw_text(screen, f"Rejected: {mine.rejected_loads}  Silent errors: {mine.silent_errors}", (panel_x + 15, panel_y + 118))
+        draw_text(screen, f"[M] Miner ${mine.price('miner')}  [S] Speed ${mine.price('speed')}  [I] Inspector ${mine.price('inspector')}", (panel_x + 15, panel_y + 146), (255, 220, 100))
+        draw_text(screen, "[1-9] Select miner", (panel_x + 535, panel_y + 62), (255, 220, 100))
     elif game_state == "start":
         start_button.draw(screen)
     elif game_state == "transition":
