@@ -1,13 +1,33 @@
+import csv
 import os
 import random
+import statistics
 import sys
 import math
+from datetime import datetime
+
+BENCHMARK_MODE = "--benchmark" in sys.argv
+if BENCHMARK_MODE:
+    # Run without opening a window or using the sound card.
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_AUDIODRIVER"] = "dummy"
+
 import pygame
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quantum_backend import Layout as QuantumLayout, NoiseConfig, run_batch
 from economy import Economy, upgrade_price
 from entities import Inspector as QuantumInspector, Storage
 import sfx
+import outcomes
+from game_strategies import all_strategies
+
+GAME_SECONDS = 180.0
+# Each test case fixes the map and every error draw, so all strategies
+# played on the same test case face identical conditions.
+TEST_CASES = {"A": 101, "B": 202, "C": 303}
+RESULTS_CSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results", "results.csv"
+)
 
 pygame.mixer.pre_init(44100, -16, 1, 512)
 pygame.init()
@@ -32,6 +52,7 @@ start_transition_at = None
 font = pygame.font.Font(None, 28)
 large_font = pygame.font.Font(None, 42)
 title_font = pygame.font.Font(None, 96)
+heading_font = pygame.font.Font(None, 64)
 subtitle_font = pygame.font.Font(None, 34)
 GAME_TITLE = "Quantum Mining Tycoon"
 REFRESH_COOLDOWN = 120.0
@@ -174,7 +195,7 @@ class Transition:
 
 
 class TileMap:
-    def __init__(self):
+    def __init__(self, seed=None):
         tile_files = {
             "base": "rock_base.png",
             "base2": "rock_base2.png",
@@ -184,7 +205,7 @@ class TileMap:
             "empty": "empty.png",
         }
         self.tiles = {}
-        self.rng = random.Random()
+        self.rng = random.Random(seed)
 
         for tile_name, file_name in tile_files.items():
             tile_path = os.path.join(ASSETS_DIR, file_name)
@@ -197,6 +218,10 @@ class TileMap:
             self.create_row()
             for _ in range(GRID_ROWS)
         ]
+        # Permanent id of each visible row, so a tile keeps the same identity
+        # (and the same error draws) after the map scrolls.
+        self.row_ids = list(range(GRID_ROWS))
+        self.next_row_id = GRID_ROWS
         self.error = 0.05
         self.left_to_scroll_layers_total = len(self.layout) - 1
         self.mining_targets = []
@@ -286,6 +311,9 @@ class TileMap:
             if self.scroll_offset <= -TILE_SIZE:
                 self.layout.pop(0)
                 self.layout.append(self.create_row())
+                self.row_ids.pop(0)
+                self.row_ids.append(self.next_row_id)
+                self.next_row_id += 1
                 self.refresh_gold_quantities()
                 self.scroll_offset += TILE_SIZE
                 self.left_to_scroll_layers_total -= 1
@@ -353,8 +381,16 @@ class MineController:
     MINING_SECONDS = 1.8
     BROKEN_FRAME_AT = 0.75
 
-    def __init__(self, tile_map):
+    def __init__(self, tile_map, seed=0):
         self.tile_map = tile_map
+        self.seed = seed
+        # How many times each gold tile has been attempted, so a retry after
+        # an error gets a fresh (but still reproducible) draw.
+        self.attempts = {}
+        self.target_keys = [None]
+        self.load_keys = [None]
+        self.revenue = 0.0
+        self.false_alarms = 0
         self.storage = Storage(capacity=9999)
         self.economy = Economy(credits=50)
         # Speeds are deliberately conservative at the start so the round trip
@@ -419,6 +455,8 @@ class MineController:
             self.target_is_rock.append(False)
             self.loads.append(0)
             self.inspector_pulse_timers.append(0.0)
+            self.target_keys.append(None)
+            self.load_keys.append(None)
         elif upgrade == "speed":
             self.global_speed += 0.25
             self.speeds = [self.global_speed for _ in self.speeds]
@@ -446,6 +484,8 @@ class MineController:
             self.target_is_rock,
             self.loads,
             self.inspector_pulse_timers,
+            self.target_keys,
+            self.load_keys,
         ):
             values.pop(index)
         self.selected = None
@@ -463,9 +503,10 @@ class MineController:
         return True
 
     def choose_target(self, miner_index):
+        """Return (column, is_impurity, (tile, attempt)) for the next trip."""
         row_index = self.rows[miner_index]
         if row_index >= len(self.tile_map.layout) - 1:
-            return None, False
+            return None, False, None
         gold_targets = []
         for column_index, tile_name in enumerate(self.tile_map.layout[row_index]):
             if tile_name == "gold" and self.tile_map.gold_quantities.get(
@@ -478,11 +519,16 @@ class MineController:
             for column_index, tile_name in enumerate(self.tile_map.layout[row_index])
             if tile_name in rock_tiles
         ]
-        if rock_targets and self.rng.random() < self.error:
-            return self.rng.choice(rock_targets), True
-        if gold_targets:
-            return gold_targets[0], False
-        return None, False
+        if not gold_targets:
+            return None, False, None
+        column_index = gold_targets[0]
+        tile = (self.tile_map.row_ids[row_index], column_index)
+        attempt = self.attempts.get(tile, 0)
+        key = (tile, attempt)
+        # An error turns this trip into an impurity: the miner brings back rock.
+        if rock_targets and outcomes.is_error(self.seed, tile, attempt, self.error):
+            return outcomes.pick(self.seed, tile, attempt, rock_targets), True, key
+        return column_index, False, key
 
     def advance_row(self, miner_index):
         next_row = self.rows[miner_index] + len(self.rows)
@@ -501,25 +547,24 @@ class MineController:
     def all_assigned_rows_empty(self):
         return all(self.choose_target(index)[0] is None for index in range(len(self.rows)))
 
-    def outcome(self, miner_index):
-        is_rock = self.rng.random() < self.error
-        flagged = (
-            is_rock
-            and self.inspectors[miner_index]
-            and self.rng.random() < min(0.95, 0.65 + self.error)
-        )
-        return is_rock, flagged
-
     def deliver(self, miner_index):
         is_rock = self.loads[miner_index] == "rock"
+        key = self.load_keys[miner_index]
         flagged = (
-            is_rock
-            and self.inspectors[miner_index]
-            and self.rng.random() < min(0.95, 0.65 + self.error)
+            self.inspectors[miner_index]
+            and key is not None
+            and outcomes.inspector_flags(self.seed, key[0], key[1], is_rock, self.error)
         )
+        self.load_keys[miner_index] = None
         self.total_actions += 1
         if is_rock and flagged:
             self.rejected_loads += 1
+            self.inspector_pulse_timers[miner_index] = 0.7
+            sfx.play("reject")
+        elif flagged:
+            # False alarm: the noisy check throws away a valid load.
+            self.rejected_loads += 1
+            self.false_alarms += 1
             self.inspector_pulse_timers[miner_index] = 0.7
             sfx.play("reject")
         elif is_rock:
@@ -534,13 +579,14 @@ class MineController:
             self.storage.deposit(1)
             self.last_quality = self.total_real_ore / self.total_delivered_loads
             self.economy.credits += 20.0 * self.last_quality
+            self.revenue += 20.0 * self.last_quality
             sfx.play("gold")
         if not flagged:
             self.storage_pulse_timer = 0.7
             self.storage_pulse_is_rock = is_rock
             self.storage_pulse_color = (255, 70, 70) if is_rock else (80, 255, 100)
         self.loads[miner_index] = 0
-        if is_rock and flagged:
+        if flagged:
             self.states[miner_index] = "rejected"
             self.timers[miner_index] = 0.0
         else:
@@ -565,11 +611,16 @@ class MineController:
         return distance / self.move_speed(miner_index)
 
     def start_next_trip(self, miner_index):
-        target, is_rock = self.choose_target(miner_index)
+        target, is_rock, key = self.choose_target(miner_index)
         while target is None and self.advance_row(miner_index):
-            target, is_rock = self.choose_target(miner_index)
+            target, is_rock, key = self.choose_target(miner_index)
         self.targets[miner_index] = target
         self.target_is_rock[miner_index] = is_rock
+        self.target_keys[miner_index] = key
+        if is_rock:
+            # The gold tile is still there; the next attempt gets a new draw.
+            tile, attempt = key
+            self.attempts[tile] = attempt + 1
         self.timers[miner_index] = 0.0
         if target is None:
             self.states[miner_index] = "idle"
@@ -668,6 +719,7 @@ class MineController:
                         self.tile_map.layout[row][column] = "empty"
                     if self.target_is_rock[index]:
                         self.loads[index] = "rock"
+                    self.load_keys[index] = self.target_keys[index]
                     self.target_is_rock[index] = False
                     self.states[index] = "returning"
                     self.timers[index] = 0.0
@@ -679,6 +731,87 @@ class MineController:
 
         if all(state == "idle" for state in self.states) and not self.tile_map.is_scrolling:
             self.tile_map.start_row_scroll()
+
+    def stats(self):
+        """Measurable results of a run (one row of the comparison / CSV)."""
+        levels = self.economy.levels or {}
+        return {
+            "score": round(self.revenue, 1),
+            "gold_delivered": self.total_gold_ore,
+            "purity": round(self.last_quality, 3),
+            "accepted_rate": round(self.total_real_ore / max(1, self.total_actions), 3),
+            "rejected": self.rejected_loads,
+            "false_alarms": self.false_alarms,
+            "silent_errors": self.silent_errors,
+            "miners": len(self.speeds),
+            "speed_upgrades": levels.get("speed", 0),
+            "inspectors": sum(self.inspectors),
+            "final_error_rate": round(self.error, 2),
+        }
+
+
+def simulate(strategy, seed, seconds=GAME_SECONDS, step=1.0 / 60.0):
+    """Play one full game with an automatic strategy, without drawing."""
+    sfx.suspend(True)
+    try:
+        sim_map = TileMap(seed)
+        sim_map.y = 0.0
+        sim_map.start_mining()
+        sim_mine = MineController(sim_map, seed)
+        elapsed = 0.0
+        next_decision = 0.0
+        while elapsed < seconds:
+            if elapsed >= next_decision:
+                strategy.decide(sim_mine)
+                next_decision += 1.0
+            sim_mine.update(step)
+            elapsed += step
+        return sim_mine.stats()
+    finally:
+        sfx.suspend(False)
+
+
+def save_results(test_case, seed, rows):
+    """Append result rows to results/results.csv for the README and slides."""
+    os.makedirs(os.path.dirname(RESULTS_CSV), exist_ok=True)
+    is_new = not os.path.exists(RESULTS_CSV)
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as handle:
+        writer = None
+        for name, stats in rows:
+            record = {
+                "timestamp": timestamp,
+                "test_case": test_case,
+                "seed": seed,
+                "strategy": name,
+                "seconds": GAME_SECONDS,
+                **stats,
+            }
+            if writer is None:
+                writer = csv.DictWriter(handle, fieldnames=list(record))
+                if is_new:
+                    writer.writeheader()
+            writer.writerow(record)
+
+
+def run_benchmark(seed_count):
+    """Compare every strategy on the same seeds and print mean +/- std."""
+    seeds = list(range(1, seed_count + 1))
+    print(f"Benchmark: {len(seeds)} seeds x {GAME_SECONDS:.0f} s per game")
+    for strategy in all_strategies():
+        results = [simulate(strategy, seed) for seed in seeds]
+        for seed, stats in zip(seeds, results):
+            save_results("benchmark", seed, [(strategy.name, stats)])
+        scores = [stats["score"] for stats in results]
+        purity = [stats["purity"] for stats in results]
+        silent = [stats["silent_errors"] for stats in results]
+        spread = statistics.stdev(scores) if len(scores) > 1 else 0.0
+        print(
+            f"{strategy.name:28s} score {statistics.mean(scores):7.1f} +/- {spread:5.1f}"
+            f"  purity {statistics.mean(purity):.0%}"
+            f"  silent errors {statistics.mean(silent):.1f}"
+        )
+    print(f"Saved to {RESULTS_CSV}")
 
 
 def draw_text(surface, text, position, color=(255, 255, 255), selected_font=None):
@@ -693,9 +826,13 @@ storage_sprite = Sprite(
     os.path.join(ASSETS_DIR, "storage.webp"), (72, 72)
 )
 start_button = Btn(screen.get_width() // 2, screen.get_height() // 2)
+test_case = "A"
+results_rows = []
+ending_frames = 0
 transition_animation = Transition()
-tile_map = TileMap()
-mine = MineController(tile_map)
+tile_map = TileMap(TEST_CASES[test_case])
+mine = MineController(tile_map, TEST_CASES[test_case])
+play_time = 0.0
 management_button_x = RIGHT - 105
 sell_miner_button = ManagementButton(management_button_x, BOTTOM - 109, "Sell miner $20")
 sell_inspector_button = ManagementButton(
@@ -707,6 +844,100 @@ refresh_map_button = ManagementButton(management_button_x, BOTTOM - 25, "Refresh
 pause_button = ManagementButton(RIGHT - 75, 28, "Pause [P]", size=(130, 36))
 seconds_since_scroll = 0.0
 running = True
+
+
+def new_game():
+    """Reset everything for a fresh run on the current test case."""
+    global transition_animation, tile_map, mine, visual_miners
+    global seconds_since_scroll, play_time, start_transition_at, ending_frames
+    seed = TEST_CASES[test_case]
+    transition_animation = Transition()
+    tile_map = TileMap(seed)
+    mine = MineController(tile_map, seed)
+    visual_miners = [Miner(110, TILE_SIZE // 2)]
+    seconds_since_scroll = 0.0
+    play_time = 0.0
+    start_transition_at = None
+    ending_frames = 0
+    pause_button.label = "Pause [P]"
+
+
+def finish_game():
+    """Compare the player with every automatic strategy on the same test case."""
+    global results_rows
+    seed = TEST_CASES[test_case]
+    results_rows = [("You", mine.stats())] + [
+        (strategy.name, simulate(strategy, seed)) for strategy in all_strategies()
+    ]
+    save_results(test_case, seed, results_rows)
+
+
+def draw_results_screen(surface):
+    surface.fill((14, 16, 26))
+    seed = TEST_CASES[test_case]
+    draw_text(surface, f"Time's up!  Test case {test_case} (seed {seed})", (40, 35), (255, 215, 90), heading_font)
+    draw_text(
+        surface,
+        "Same map and same error draws for every row: only the strategy changes.",
+        (42, 105),
+        (200, 210, 225),
+    )
+    columns = [
+        ("Strategy", 40), ("Score", 330), ("Gold", 555), ("Purity", 615),
+        ("Rejected", 695), ("False alarms", 795), ("Silent errors", 925),
+    ]
+    header_y = 150
+    for label, x in columns:
+        draw_text(surface, label, (x, header_y), (255, 220, 100))
+    best_score = max(stats["score"] for _, stats in results_rows) or 1.0
+    for row_index, (name, stats) in enumerate(results_rows):
+        y = header_y + 45 + row_index * 52
+        is_player = name == "You"
+        if is_player:
+            pygame.draw.rect(surface, (40, 60, 90), (30, y - 10, RIGHT - 60, 44), border_radius=6)
+        color = (255, 255, 255) if is_player else (215, 225, 240)
+        draw_text(surface, name, (40, y), color)
+        bar_width = int(150 * stats["score"] / best_score)
+        bar_color = (80, 200, 255) if is_player else (90, 200, 120)
+        pygame.draw.rect(surface, bar_color, (395, y + 2, max(2, bar_width), 18), border_radius=4)
+        draw_text(surface, f"{stats['score']:.0f}", (330, y), color)
+        draw_text(surface, str(stats["gold_delivered"]), (555, y), color)
+        draw_text(surface, f"{stats['purity']:.0%}", (615, y), color)
+        draw_text(surface, str(stats["rejected"]), (695, y), color)
+        draw_text(surface, str(stats["false_alarms"]), (795, y), color)
+        draw_text(surface, str(stats["silent_errors"]), (925, y), color)
+    player_score = results_rows[0][1]["score"]
+    best_name, best_stats = max(results_rows[1:], key=lambda row: row[1]["score"])
+    summary_y = header_y + 45 + len(results_rows) * 52 + 20
+    draw_text(
+        surface,
+        f"Your score is {player_score / max(1.0, best_stats['score']):.0%} of the best strategy ({best_name}).",
+        (40, summary_y),
+        (255, 255, 255),
+        large_font,
+    )
+    draw_text(
+        surface,
+        "Score = credits earned from delivered gold (20 x purity per load) during "
+        f"{GAME_SECONDS / 60:.0f} minutes.",
+        (40, summary_y + 45),
+        (200, 210, 225),
+    )
+    draw_text(
+        surface,
+        "Inspectors raise purity and catch errors, but they cost credits and sometimes reject good loads:",
+        (40, summary_y + 90),
+        (255, 220, 100),
+    )
+    draw_text(
+        surface,
+        "protection only pays off once errors are frequent enough. That is the break-even point.",
+        (40, summary_y + 118),
+        (255, 220, 100),
+    )
+    relative_path = os.path.relpath(RESULTS_CSV, os.path.dirname(BASE_DIR))
+    draw_text(surface, f"Saved to {relative_path}", (40, BOTTOM - 70), (150, 160, 175))
+    draw_text(surface, "[R] Play again      [Q] Quit", (40, BOTTOM - 40), (255, 220, 100))
 
 
 def toggle_pause():
@@ -740,6 +971,14 @@ def draw_title_screen(surface):
     controls_rect = controls.get_rect(center=(RIGHT // 2, BOTTOM - 60))
     surface.blit(font.render(controls_text, True, (20, 20, 30)), controls_rect.move(2, 2))
     surface.blit(controls, controls_rect)
+    case_text = (
+        f"Test case: {test_case}   [T] change      "
+        f"Game length: {GAME_SECONDS / 60:.0f} min"
+    )
+    case_label = subtitle_font.render(case_text, True, (255, 255, 255))
+    case_rect = case_label.get_rect(center=(RIGHT // 2, BOTTOM // 2 + 120))
+    surface.blit(subtitle_font.render(case_text, True, (20, 20, 30)), case_rect.move(2, 2))
+    surface.blit(case_label, case_rect)
 
 
 def draw_pause_overlay(surface):
@@ -758,12 +997,31 @@ def draw_pause_overlay(surface):
     pause_button.draw(surface)
 
 
+if BENCHMARK_MODE:
+    position = sys.argv.index("--benchmark")
+    count = sys.argv[position + 1] if len(sys.argv) > position + 1 else "10"
+    run_benchmark(int(count) if count.isdigit() else 10)
+    pygame.quit()
+    sys.exit(0)
+
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+        elif game_state == "results" and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_r:
+                new_game()
+                game_state = "start"
+                sfx.play("click")
+            elif event.key == pygame.K_q:
+                running = False
         elif game_state == "start" and start_transition_at is None:
-            if start_button.was_clicked(event):
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_t:
+                names = list(TEST_CASES)
+                test_case = names[(names.index(test_case) + 1) % len(names)]
+                new_game()
+                sfx.play("click")
+            elif start_button.was_clicked(event):
                 sfx.play("start")
                 game_state = "transition"
                 start_transition_at = pygame.time.get_ticks()
@@ -831,6 +1089,10 @@ while running:
                 seconds_since_scroll = 0.0
             elif not tile_map.is_scrolling:
                 seconds_since_scroll += delta_seconds
+            play_time += delta_seconds
+            if play_time >= GAME_SECONDS:
+                game_state = "ending"
+                sfx.play("start")
         tile_map.draw(screen)
         for index, visual_miner in enumerate(visual_miners):
             visual_miner.set_position(mine.visual_position(index))
@@ -912,6 +1174,16 @@ while running:
         draw_text(screen, f"Rejected: {mine.rejected_loads}  Silent errors: {mine.silent_errors}", (panel_x + 15, panel_y + 118))
         draw_text(screen, f"[M] Miner ${mine.price('miner')}  [S] Speed ${mine.price('speed')}  [I] Inspector ${mine.price('inspector')}", (panel_x + 15, panel_y + 146), (255, 220, 100))
         draw_text(screen, "[1-9] Select miner", (panel_x + 535, panel_y + 62), (255, 220, 100))
+        time_left = max(0, math.ceil(GAME_SECONDS - play_time))
+        time_color = (255, 110, 110) if time_left <= 20 else (255, 255, 255)
+        draw_text(
+            screen,
+            f"Time {time_left // 60}:{time_left % 60:02d}",
+            (panel_x + 535, panel_y + 92),
+            time_color,
+            large_font,
+        )
+        draw_text(screen, f"Test case {test_case}", (panel_x + 535, panel_y + 130), (200, 210, 225))
         sell_miner_button.draw(
             screen,
             mine.selected is not None and len(visual_miners) >= 2,
@@ -949,6 +1221,21 @@ while running:
             game_state = "play"
             start_transition_at = None
             tile_map.start_mining()
+    elif game_state == "ending":
+        # Draw one "please wait" frame, then run the strategies on the next one.
+        screen.fill((14, 16, 26))
+        message = large_font.render(
+            f"Time's up! Playing every strategy on test case {test_case}...",
+            True,
+            (255, 255, 255),
+        )
+        screen.blit(message, message.get_rect(center=(RIGHT // 2, BOTTOM // 2)))
+        if ending_frames > 0:
+            finish_game()
+            game_state = "results"
+        ending_frames += 1
+    elif game_state == "results":
+        draw_results_screen(screen)
 
     pygame.display.update()
     clock.tick(60)

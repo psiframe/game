@@ -26,6 +26,7 @@ _SPECS = {
 
 _sounds = {}
 _enabled = False
+_suspended = False
 
 
 def _render(segments, shape, volume, noise, decay):
@@ -73,8 +74,14 @@ def init():
 
 
 def play(name):
-    if _enabled and name in _sounds:
+    if _enabled and not _suspended and name in _sounds:
         _sounds[name].play()
+
+
+def suspend(value):
+    """Silence sounds temporarily, e.g. while strategies are simulated."""
+    global _suspended
+    _suspended = value
 
 
 def toggle():
