@@ -7,8 +7,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quantum_backend import Layout as QuantumLayout, NoiseConfig, run_batch
 from economy import Economy, upgrade_price
 from entities import Inspector as QuantumInspector, Storage
+import sfx
 
+pygame.mixer.pre_init(44100, -16, 1, 512)
 pygame.init()
+sfx.init()
 
 # --- DYNAMIC FILE PATH SETUP ---
 # This finds the exact directory your script lives in
@@ -22,16 +25,20 @@ GRID_COLUMNS = (RIGHT // TILE_SIZE)
 GRID_ROWS = (BOTTOM // TILE_SIZE) + 1
 
 screen = pygame.display.set_mode((1080, 720))
-pygame.display.set_caption('Quantum Mining Tycoon')
+pygame.display.set_caption("Quantum Mining Tycoon")
 clock = pygame.time.Clock()
 game_state = "start"
 start_transition_at = None
 font = pygame.font.Font(None, 28)
 large_font = pygame.font.Font(None, 42)
+title_font = pygame.font.Font(None, 96)
+subtitle_font = pygame.font.Font(None, 34)
+GAME_TITLE = "Quantum Mining Tycoon"
+REFRESH_COOLDOWN = 120.0
 
 # Generate absolute path for background image
 sky_path = os.path.join(ASSETS_DIR, "sky.jpg")
-background = pygame.image.load(sky_path).convert()
+background = pygame.transform.scale(pygame.image.load(sky_path).convert(), (RIGHT, BOTTOM))
 
 
 class Btn:
@@ -274,16 +281,19 @@ class TileMap:
             self.scroll_velocity += (220.0 - self.scroll_velocity) * min(1.0, delta_seconds * 6.0)
             self.scroll_offset -= self.scroll_velocity * delta_seconds
 
-            if self.scroll_offset <= TILE_SIZE:
+            # The offset moves from 0 down to -TILE_SIZE, then one row is
+            # replaced. Keep the velocity so the scroll stays smooth.
+            if self.scroll_offset <= -TILE_SIZE:
                 self.layout.pop(0)
                 self.layout.append(self.create_row())
                 self.refresh_gold_quantities()
-                self.scroll_offset = 0.0
-                self.scroll_velocity = 0.0
+                self.scroll_offset += TILE_SIZE
                 self.left_to_scroll_layers_total -= 1
 
                 if self.left_to_scroll_layers_total <= 0:
                     self.is_scrolling = False
+                    self.scroll_offset = 0.0
+                    self.scroll_velocity = 0.0
                 self.set_current_row()
             return
 
@@ -315,9 +325,15 @@ class TileMap:
             self.mining_timer = 0.0
 
     def start_row_scroll(self):
+        if self.is_scrolling:
+            return
+        # Reset the row counter on every refresh. Without this, the first
+        # refresh leaves it at 0 and every later refresh scrolls one row only.
+        self.left_to_scroll_layers_total = len(self.layout) - 1
         self.is_scrolling = True
         self.scroll_offset = 0.0
         self.scroll_velocity = 0.0
+        sfx.play("refresh")
 
     def draw(self, surface, y=None):
         map_y = self.y + self.scroll_offset if y is None else y
@@ -505,8 +521,10 @@ class MineController:
         if is_rock and flagged:
             self.rejected_loads += 1
             self.inspector_pulse_timers[miner_index] = 0.7
+            sfx.play("reject")
         elif is_rock:
             self.silent_errors += 1
+            sfx.play("error")
             self.total_delivered_loads += 1
             self.last_quality = self.total_real_ore / max(1, self.total_delivered_loads)
         else:
@@ -516,6 +534,7 @@ class MineController:
             self.storage.deposit(1)
             self.last_quality = self.total_real_ore / self.total_delivered_loads
             self.economy.credits += 20.0 * self.last_quality
+            sfx.play("gold")
         if not flagged:
             self.storage_pulse_timer = 0.7
             self.storage_pulse_is_rock = is_rock
@@ -559,6 +578,9 @@ class MineController:
 
     def remap_rows_after_scroll(self):
         for index, row in enumerate(self.rows):
+            # A refresh can interrupt a trip; bank the carried load instead of losing it.
+            if self.loads[index]:
+                self.deliver(index)
             self.rows[index] = index
             self.targets[index] = None
             self.target_is_rock[index] = False
@@ -619,7 +641,10 @@ class MineController:
                     self.states[index] = "mining"
                     self.timers[index] = 0.0
             elif self.states[index] == "mining":
+                previous_timer = self.timers[index]
                 self.timers[index] += delta_seconds
+                if previous_timer < self.BROKEN_FRAME_AT <= self.timers[index]:
+                    sfx.play("mine")
                 row = self.rows[index]
                 column = self.targets[index]
                 if column is None:
@@ -679,8 +704,59 @@ sell_inspector_button = ManagementButton(
     "Sell inspector $20",
 )
 refresh_map_button = ManagementButton(management_button_x, BOTTOM - 25, "Refresh map")
+pause_button = ManagementButton(RIGHT - 75, 28, "Pause [P]", size=(130, 36))
 seconds_since_scroll = 0.0
 running = True
+
+
+def toggle_pause():
+    global game_state
+    game_state = "pause" if game_state == "play" else "play"
+    pause_button.label = "Resume [P]" if game_state == "pause" else "Pause [P]"
+    sfx.play("pause")
+
+
+def draw_title_screen(surface):
+    title = title_font.render(GAME_TITLE, True, (255, 215, 90))
+    shadow = title_font.render(GAME_TITLE, True, (20, 20, 30))
+    title_rect = title.get_rect(center=(RIGHT // 2, BOTTOM // 2 - 220))
+    surface.blit(shadow, title_rect.move(4, 4))
+    surface.blit(title, title_rect)
+    subtitle = subtitle_font.render(
+        "Mine gold. Fight quantum errors. Decide when protection pays off.",
+        True,
+        (235, 245, 255),
+    )
+    subtitle_shadow = subtitle_font.render(
+        "Mine gold. Fight quantum errors. Decide when protection pays off.",
+        True,
+        (20, 20, 30),
+    )
+    subtitle_rect = subtitle.get_rect(center=(RIGHT // 2, BOTTOM // 2 - 150))
+    surface.blit(subtitle_shadow, subtitle_rect.move(2, 2))
+    surface.blit(subtitle, subtitle_rect)
+    controls_text = "[M] Miner   [S] Speed   [I] Inspector   [1-9] Select   [P] Pause   [N] Sound"
+    controls = font.render(controls_text, True, (255, 220, 100))
+    controls_rect = controls.get_rect(center=(RIGHT // 2, BOTTOM - 60))
+    surface.blit(font.render(controls_text, True, (20, 20, 30)), controls_rect.move(2, 2))
+    surface.blit(controls, controls_rect)
+
+
+def draw_pause_overlay(surface):
+    shade = pygame.Surface((RIGHT, BOTTOM), pygame.SRCALPHA)
+    shade.fill((0, 0, 0, 150))
+    surface.blit(shade, (0, 0))
+    paused = title_font.render("PAUSED", True, (255, 255, 255))
+    surface.blit(paused, paused.get_rect(center=(RIGHT // 2, BOTTOM // 2 - 30)))
+    sound_state = "on" if sfx.is_on() else "off"
+    hint = subtitle_font.render(
+        f"[P] or [Esc] Resume      [N] Sound: {sound_state}",
+        True,
+        (255, 220, 100),
+    )
+    surface.blit(hint, hint.get_rect(center=(RIGHT // 2, BOTTOM // 2 + 35)))
+    pause_button.draw(surface)
+
 
 while running:
     for event in pygame.event.get():
@@ -688,36 +764,55 @@ while running:
             running = False
         elif game_state == "start" and start_transition_at is None:
             if start_button.was_clicked(event):
+                sfx.play("start")
                 game_state = "transition"
                 start_transition_at = pygame.time.get_ticks()
                 tile_map.begin_transition(transition_animation.rect.bottom)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
+            sfx.toggle()
+            sfx.play("click")
+        elif (
+            game_state in ("play", "pause")
+            and event.type == pygame.KEYDOWN
+            and event.key in (pygame.K_p, pygame.K_ESCAPE)
+        ):
+            toggle_pause()
+        elif game_state in ("play", "pause") and pause_button.was_clicked(event):
+            toggle_pause()
         elif game_state == "play" and event.type == pygame.KEYDOWN:
             if pygame.K_1 <= event.key <= pygame.K_9:
                 selected = event.key - pygame.K_1
                 if selected < len(visual_miners):
                     mine.selected = selected
+                    sfx.play("click")
             upgrades = {pygame.K_m: "miner", pygame.K_s: "speed", pygame.K_i: "inspector"}
             if event.key in upgrades:
-                if mine.buy(upgrades[event.key]) and upgrades[event.key] == "miner":
-                    visual_miners.append(
-                        Miner(110, len(visual_miners) * TILE_SIZE + TILE_SIZE // 2)
-                    )
+                if mine.buy(upgrades[event.key]):
+                    sfx.play("buy")
+                    if upgrades[event.key] == "miner":
+                        visual_miners.append(
+                            Miner(110, len(visual_miners) * TILE_SIZE + TILE_SIZE // 2)
+                        )
+                else:
+                    sfx.play("denied")
         elif game_state == "play" and event.type == pygame.MOUSEBUTTONDOWN:
             selected_before_click = mine.selected
             if sell_miner_button.was_clicked(event):
                 if mine.sell_selected_miner() and selected_before_click is not None:
                     visual_miners.pop(selected_before_click)
+                    sfx.play("buy")
+                else:
+                    sfx.play("denied")
                 continue
             if sell_inspector_button.was_clicked(event):
-                mine.sell_selected_inspector()
+                sfx.play("buy" if mine.sell_selected_inspector() else "denied")
                 continue
-            if (
-                refresh_map_button.was_clicked(event)
-                and seconds_since_scroll >= 120.0
-                and not tile_map.is_scrolling
-            ):
-                tile_map.start_row_scroll()
-                seconds_since_scroll = 0.0
+            if refresh_map_button.was_clicked(event):
+                if seconds_since_scroll >= REFRESH_COOLDOWN and not tile_map.is_scrolling:
+                    tile_map.start_row_scroll()
+                    seconds_since_scroll = 0.0
+                else:
+                    sfx.play("denied")
                 continue
             mine.selected = None
             for index, visual_miner in enumerate(visual_miners):
@@ -727,14 +822,15 @@ while running:
 
     screen.blit(background, (0, 0))
 
-    if game_state == "play":
-        delta_seconds = clock.get_time() / 1000.0
-        was_scrolling = tile_map.is_scrolling
-        mine.update(delta_seconds)
-        if was_scrolling and not tile_map.is_scrolling:
-            seconds_since_scroll = 0.0
-        elif not tile_map.is_scrolling:
-            seconds_since_scroll += delta_seconds
+    if game_state in ("play", "pause"):
+        if game_state == "play":
+            delta_seconds = clock.get_time() / 1000.0
+            was_scrolling = tile_map.is_scrolling
+            mine.update(delta_seconds)
+            if was_scrolling and not tile_map.is_scrolling:
+                seconds_since_scroll = 0.0
+            elif not tile_map.is_scrolling:
+                seconds_since_scroll += delta_seconds
         tile_map.draw(screen)
         for index, visual_miner in enumerate(visual_miners):
             visual_miner.set_position(mine.visual_position(index))
@@ -805,7 +901,7 @@ while running:
         draw_text(screen, f"Purity: {mine.last_quality:.0%}  Accepted: {mine.total_real_ore / max(1, mine.total_actions):.0%}", (panel_x + 260, panel_y + 42))
         selected_label = str(selected + 1) if selected is not None else "none"
         selected_details = (
-            f"Speed: {mine.selected_speed():.0f}  "
+            f"Speed: {mine.selected_speed():.2f}  "
             f"Inspector: {'yes' if mine.selected_inspector() else 'no'}  "
             f"State: {mine.states[selected]}"
             if selected is not None
@@ -824,11 +920,24 @@ while running:
             screen,
             mine.selected is not None and mine.selected_inspector(),
         )
+        # Show the cooldown so a disabled button doesn't look broken.
+        remaining = max(0, math.ceil(REFRESH_COOLDOWN - seconds_since_scroll))
+        if tile_map.is_scrolling:
+            refresh_map_button.label = "Refreshing..."
+        elif remaining > 0:
+            refresh_map_button.label = f"Refresh in {remaining // 60}:{remaining % 60:02d}"
+        else:
+            refresh_map_button.label = "Refresh map"
         refresh_map_button.draw(
             screen,
-            seconds_since_scroll >= 120.0 and not tile_map.is_scrolling,
+            remaining == 0 and not tile_map.is_scrolling,
         )
+        if game_state == "pause":
+            draw_pause_overlay(screen)
+        else:
+            pause_button.draw(screen)
     elif game_state == "start":
+        draw_title_screen(screen)
         start_button.draw(screen)
     elif game_state == "transition":
         delta_seconds = clock.get_time() / 1000.0
@@ -840,10 +949,6 @@ while running:
             game_state = "play"
             start_transition_at = None
             tile_map.start_mining()
-    elif game_state == "pause":
-        pass
-    else:
-        pass    
 
     pygame.display.update()
     clock.tick(60)
