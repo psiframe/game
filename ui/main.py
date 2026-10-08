@@ -397,8 +397,13 @@ class MineController:
         # and mining animation are easy to follow.
         self.global_speed = 0.45
         self.speeds = [self.global_speed]
+
+        # no more hard coded rng, use quantum
         self.error = 0.05
         self.rng = random.Random(7)
+
+        #quntum_function(gamestate,)
+
         self.inspectors = [False]
         self.rows = list(range(len(self.speeds)))
         self.states = ["idle"]
@@ -550,11 +555,12 @@ class MineController:
     def deliver(self, miner_index):
         is_rock = self.loads[miner_index] == "rock"
         key = self.load_keys[miner_index]
-        flagged = (
-            self.inspectors[miner_index]
-            and key is not None
-            and outcomes.inspector_flags(self.seed, key[0], key[1], is_rock, self.error)
-        )
+        miner_count = len(self.speeds)
+        inspector_presence = self.inspectors[miner_index]
+        quantum_random = outcomes.inspector_flags(miner_count, inspector_presence, self.global_speed)
+        print("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n")
+        print(quantum_random)
+        flagged = quantum_random < 0.73
         self.load_keys[miner_index] = None
         self.total_actions += 1
         if is_rock and flagged:
@@ -577,7 +583,8 @@ class MineController:
             self.total_gold_ore += 1
             self.total_delivered_loads += 1
             self.storage.deposit(1)
-            self.last_quality = self.total_real_ore / self.total_delivered_loads
+            self.last_quality = quantum_random
+            
             self.economy.credits += 20.0 * self.last_quality
             self.revenue += 20.0 * self.last_quality
             sfx.play("gold")
@@ -1172,7 +1179,7 @@ while running:
         draw_text(screen, f"Miners: {len(visual_miners)}  Selected: {selected_label}", (panel_x + 15, panel_y + 62))
         draw_text(screen, selected_details, (panel_x + 15, panel_y + 90))
         draw_text(screen, f"Rejected: {mine.rejected_loads}  Silent errors: {mine.silent_errors}", (panel_x + 15, panel_y + 118))
-        draw_text(screen, f"[M] Miner ${mine.price('miner')}  [S] Speed ${mine.price('speed')}  [I] Inspector ${mine.price('inspector')}", (panel_x + 15, panel_y + 146), (255, 220, 100))
+        draw_text(screen, f"[M] Miner ${mine.price('miner')}  [S] Effiency ${mine.price('speed')}  [I] Inspector ${mine.price('inspector')}", (panel_x + 15, panel_y + 146), (255, 220, 100))
         draw_text(screen, "[1-9] Select miner", (panel_x + 535, panel_y + 62), (255, 220, 100))
         time_left = max(0, math.ceil(GAME_SECONDS - play_time))
         time_color = (255, 110, 110) if time_left <= 20 else (255, 255, 255)
